@@ -1,0 +1,93 @@
+name: Build mod
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed only for the tag release step
+
+env:
+  FORGE_VERSION: "1.20.1-47.3.0"   # bump to another 1.20.1 Forge build if you like
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Locate mod source in this repo
+        id: locate
+        run: |
+          echo "Files in repo:"
+          git ls-files | head -50
+          MATCHES=$(find . -path ./mdk -prune -o -name FreeAimMod.java -print)
+          COUNT=$(echo "$MATCHES" | grep -c . || true)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::FreeAimMod.java was not found in the repo. Commit the contents of freeaim-src.zip (the 'src' folder) to the repository."
+            exit 1
+          fi
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::error::Found $COUNT copies of the mod source (listed below). Delete the old ones so only one remains."
+            echo "$MATCHES"
+            exit 1
+          fi
+          SRC_MAIN=$(dirname "$MATCHES" | sed 's#/java/.*##')
+          echo "Found mod source root: $SRC_MAIN"
+          echo "src_main=$SRC_MAIN" >> "$GITHUB_OUTPUT"
+          CLIENT=$(find "$SRC_MAIN/java" -name FreeAimClient.java)
+          echo "FreeAimClient.java: $(wc -l < "$CLIENT") lines, sha256 $(sha256sum "$CLIENT" | cut -c1-12)"
+          echo "contains 'handYaw' (newest version marker): $(grep -c handYaw "$CLIENT")"
+          echo "commit: $GITHUB_SHA"
+          echo "src_main=$SRC_MAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Download Forge MDK
+        run: |
+          curl -fL -o mdk.zip "https://maven.minecraftforge.net/net/minecraftforge/forge/${FORGE_VERSION}/forge-${FORGE_VERSION}-mdk.zip"
+          mkdir mdk
+          unzip -q mdk.zip -d mdk
+
+      - name: Swap in the mod source
+        run: |
+          SRC_MAIN="${{ steps.locate.outputs.src_main }}"
+          rm -rf mdk/src/main/java
+          cp -r "$SRC_MAIN/java" mdk/src/main/java
+          if [ -d "$SRC_MAIN/resources" ]; then
+            cp -r "$SRC_MAIN/resources/." mdk/src/main/resources/
+          fi
+          cd mdk
+          sed -i 's/^mod_id=.*/mod_id=freeaim/' gradle.properties
+          sed -i 's/^mod_group_id=.*/mod_group_id=com.example.freeaim/' gradle.properties
+          sed -i 's/^mod_name=.*/mod_name=Free Aim/' gradle.properties
+          grep -E '^(mod_id|mod_group_id|mod_name)=' gradle.properties
+
+      - name: Build
+        working-directory: mdk
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: freeaim-jar
+          path: mdk/build/libs/*.jar
+          if-no-files-found: error
+
+      - name: Publish GitHub release (on v* tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mdk/build/libs/*.jar
