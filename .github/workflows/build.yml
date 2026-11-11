@@ -10,6 +10,9 @@ on:
 permissions:
   contents: write   # needed only for the tag release step
 
+env:
+  FORGE_VERSION: "1.20.1-47.3.0"   # bump to another 1.20.1 Forge build if you like
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,7 +28,26 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Download Forge MDK
+        run: |
+          curl -fL -o mdk.zip "https://maven.minecraftforge.net/net/minecraftforge/forge/${FORGE_VERSION}/forge-${FORGE_VERSION}-mdk.zip"
+          mkdir mdk
+          unzip -q mdk.zip -d mdk
+          ls mdk
+
+      - name: Swap in the mod source
+        working-directory: mdk
+        run: |
+          rm -rf src/main/java
+          cp -r ../src/main/java src/main/java
+          cp -r ../src/main/resources/. src/main/resources/
+          sed -i 's/^mod_id=.*/mod_id=freeaim/' gradle.properties
+          sed -i 's/^mod_group_id=.*/mod_group_id=com.example.freeaim/' gradle.properties
+          sed -i 's/^mod_name=.*/mod_name=Free Aim/' gradle.properties
+          grep -E '^(mod_id|mod_group_id|mod_name)=' gradle.properties
+
       - name: Build
+        working-directory: mdk
         run: |
           chmod +x gradlew
           ./gradlew build --no-daemon
@@ -34,11 +56,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: freeaim-jar
-          path: build/libs/*.jar
+          path: mdk/build/libs/*.jar
           if-no-files-found: error
 
       - name: Publish GitHub release (on v* tags)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: build/libs/*.jar
+          files: mdk/build/libs/*.jar
