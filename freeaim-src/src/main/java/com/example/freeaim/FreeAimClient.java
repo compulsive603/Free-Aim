@@ -22,6 +22,9 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.HumanoidArm;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.projectile.ProjectileUtil;
 import net.minecraft.world.item.ItemDisplayContext;
 import net.minecraft.world.item.ItemStack;
@@ -36,6 +39,7 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.client.event.ClientPlayerNetworkEvent;
 import net.minecraftforge.client.event.InputEvent;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
 import net.minecraftforge.client.event.RenderGuiOverlayEvent;
@@ -52,13 +56,10 @@ import org.lwjgl.glfw.GLFW;
 /**
  * Free Aim, VR-style (Vivecraft-like) controls with just a mouse.
  *
- * Your hand is a real object in the world, hanging off your shoulder, and it has its OWN aim
- * (yaw/pitch in world space) that the mouse controls. Hits, mining and "use" all come from
- * where the hand points, not from the screen centre.
- * The camera is a separate "head": it eases toward wherever the hand points, and is dragged
- * along if the hand strays too far from the middle of your view. Because the hand lives in
- * the world, it stays pointing at its target while the camera turns.
- * Hold the LOOK key to move only the head (the hand stays put in the world).
+ * The hand is a real object in the world, hanging off your shoulder, with its own aim that the
+ * mouse controls. The camera is a separate "head" that eases toward where the hand points.
+ * Swinging the hand fast hits mobs / starts breaking blocks, and swinging into an incoming attack
+ * or arrow (or holding guard) parries it. Settings: Mods -> Free Aim -> Config.
  */
 @Mod.EventBusSubscriber(modid = FreeAimMod.MODID, value = Dist.CLIENT)
 public class FreeAimClient {
@@ -71,28 +72,36 @@ public class FreeAimClient {
             "key.freeaim.look", KeyConflictContext.IN_GAME,
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_LEFT_ALT, "key.categories.freeaim");
 
-    // ---- tweakables ----
-    private static final double HAND_SENSITIVITY = 1.0;  // hand turns at your normal mouse sensitivity x this
-    private static final double FOLLOW_RATE = 1.2;       // how quickly the head eases toward the hand (1/s, 0 = never)
-    private static final double CONE_YAW = 28.0;         // hand may stray this far (deg) from view centre before it drags the camera
-    private static final double CONE_PITCH = 20.0;
-    private static final double HAND_MAX_YAW = 100.0;    // hand can't be left further than this behind when you use the LOOK key
+    /** Hold to guard. Middle mouse button also guards. */
+    public static final KeyMapping GUARD = new KeyMapping(
+            "key.freeaim.guard", KeyConflictContext.IN_GAME,
+            InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_Z, "key.categories.freeaim");
+
+    // ---- fixed tuning (everything else is in FreeAimConfig) ----
+    private static final double HAND_MAX_YAW = 100.0;
     private static final double HAND_MAX_PITCH = 75.0;
-    private static final double ARM = 0.6;               // shoulder to grip distance
-    private static final double SHOULDER_SIDE = 0.30;    // shoulder offset to the side of the eyes
-    private static final double SHOULDER_DROP = 0.18;    // ...and below them
-    private static final float HAND_SCALE = 0.85f;       // size of the held item / arm
+    private static final double SHOULDER_SIDE = 0.30;
+    private static final double SHOULDER_DROP = 0.18;
     private static final double HAND_FOV_TAN = Math.tan(Math.toRadians(35.0)); // vanilla draws hands with a 70° FOV
+    private static final int SWING_MINE_HOLD_TICKS = 8;
+    private static final long SWING_ATTACK_GAP_NANOS = 200_000_000L;
 
     // the hand's aim, in world space (degrees; pitch positive = down, like the player)
     private static double handYaw = 0.0, handPitch = 0.0;
-    // last computed aim ray (used by the reticle)
+    private static double lastHandYaw = 0.0, lastHandPitch = 0.0;
+    private static double swingSpeed = 0.0;                 // smoothed hand speed, degrees/second
     private static Vec3 aimStart = Vec3.ZERO, aimDir = new Vec3(0, 0, 1);
 
     private static boolean enabled = false;
+    private static boolean pendingAuto = false;
     private static boolean leftDown = false;
+    private static boolean middleDown = false;
     private static boolean cursorHidden = false;
     private static boolean skipDelta = true;
+    private static boolean lastSentActive = false;
+    private static int swingMineTicks = 0;
+    private static long lastSwingAttackNanos = 0L;
+    private static long parryUntilNanos = 0L;
     private static long lastFrameNanos = System.nanoTime();
 
     @Mod.EventBusSubscriber(modid = FreeAimMod.MODID, bus = Mod.EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
@@ -101,6 +110,7 @@ public class FreeAimClient {
         public static void registerKeys(RegisterKeyMappingsEvent event) {
             event.register(TOGGLE);
             event.register(LOOK);
+            event.register(GUARD);
         }
     }
 
@@ -142,7 +152,7 @@ public class FreeAimClient {
         Vec3 dir = handDirection();
         Vec3 eye = player.getEyePosition();
 
-        Vec3 grip = shoulder(mc, camera).add(dir.scale(ARM));
+        Vec3 grip = shoulder(mc, camera).add(dir.scale(FreeAimConfig.ARM_LENGTH.get()));
         Vec3 start = grip;
         // if the hand is poking through a wall, fall back to starting at the eyes
         if (mc.level.clip(new ClipContext(eye, grip, ClipContext.Block.COLLIDER,
@@ -232,7 +242,31 @@ public class FreeAimClient {
         }
     }
 
-    // ---------------------------------------------------------------- cursor handling
+    /** Swing-attacks never hit players, and by default only hit hostile mobs. */
+    private static boolean swingMayHit(Entity target) {
+        if (!(target instanceof LivingEntity) || target instanceof Player) return false;
+        return FreeAimConfig.SWING_HITS_PASSIVE.get() || target instanceof Enemy;
+    }
+
+    /** Called every frame while the hand is moving faster than the swing threshold. */
+    private static void trySwingHit(Minecraft mc) {
+        LocalPlayer player = mc.player;
+        if (player.isUsingItem() || mc.gameMode == null) return;
+        HitResult hit = pick(mc);
+        if (hit instanceof EntityHitResult eh) {
+            if (!FreeAimConfig.SWING_ATTACK.get() || !swingMayHit(eh.getEntity())) return;
+            long now = System.nanoTime();
+            if (now - lastSwingAttackNanos < SWING_ATTACK_GAP_NANOS) return;
+            if (player.getAttackStrengthScale(0.5f) < FreeAimConfig.SWING_MIN_CHARGE.get()) return;
+            lastSwingAttackNanos = now;
+            mc.gameMode.attack(player, eh.getEntity());
+            player.swing(InteractionHand.MAIN_HAND);
+        } else if (hit instanceof BlockHitResult bh && FreeAimConfig.SWING_MINE.get()) {
+            if (!mc.level.getBlockState(bh.getBlockPos()).isAir()) swingMineTicks = SWING_MINE_HOLD_TICKS;
+        }
+    }
+
+    // ---------------------------------------------------------------- state helpers
 
     private static void setCursorHidden(Minecraft mc, boolean hide) {
         if (hide == cursorHidden) return;
@@ -241,7 +275,43 @@ public class FreeAimClient {
                 hide ? GLFW.GLFW_CURSOR_HIDDEN : GLFW.GLFW_CURSOR_NORMAL);
     }
 
+    private static void setEnabled(Minecraft mc, boolean on) {
+        enabled = on;
+        leftDown = false;
+        middleDown = false;
+        swingMineTicks = 0;
+        swingSpeed = 0.0;
+        if (on) {
+            handYaw = mc.player.getYRot();
+            handPitch = mc.player.getXRot() + 5.0;
+            lastHandYaw = handYaw;
+            lastHandPitch = handPitch;
+            skipDelta = true;
+        } else if (mc.screen == null) {
+            setCursorHidden(mc, false);
+            mc.mouseHandler.grabMouse();
+        }
+        mc.player.displayClientMessage(Component.literal("Free Aim: " + (on ? "ON" : "OFF")), true);
+    }
+
+    /** Tell the server where the hand is aiming (needed for parrying). Silently skipped if the server lacks the mod. */
+    private static void sendHandState(Minecraft mc, boolean active) {
+        if (!active && !lastSentActive) return;
+        var conn = mc.getConnection();
+        if (conn == null || !FreeAimNetwork.CHANNEL.isRemotePresent(conn.getConnection())) return;
+        boolean guard = active && (middleDown || GUARD.isDown());
+        boolean swinging = active && System.nanoTime() < parryUntilNanos;
+        FreeAimNetwork.CHANNEL.sendToServer(
+                new HandStatePacket(active, (float) handYaw, (float) handPitch, guard, swinging));
+        lastSentActive = active;
+    }
+
     // ---------------------------------------------------------------- events
+
+    @SubscribeEvent
+    public static void onLogin(ClientPlayerNetworkEvent.LoggingIn e) {
+        pendingAuto = true;
+    }
 
     @SubscribeEvent
     public static void onClientTick(TickEvent.ClientTickEvent e) {
@@ -250,29 +320,28 @@ public class FreeAimClient {
 
         while (TOGGLE.consumeClick()) {
             if (mc.player == null) continue;
-            enabled = !enabled;
-            leftDown = false;
-            if (enabled) {
-                handYaw = mc.player.getYRot();
-                handPitch = mc.player.getXRot() + 5.0;
-                skipDelta = true;
-            } else if (mc.screen == null) {
-                setCursorHidden(mc, false);
-                mc.mouseHandler.grabMouse();
-            }
-            mc.player.displayClientMessage(Component.literal("Free Aim: " + (enabled ? "ON" : "OFF")), true);
+            setEnabled(mc, !enabled);
         }
 
         if (mc.player == null || mc.level == null || mc.gameMode == null) {
             enabled = false;
             leftDown = false;
+            middleDown = false;
+            lastSentActive = false;
             return;
         }
+        if (pendingAuto) {
+            pendingAuto = false;
+            if (FreeAimConfig.START_ENABLED.get() && !enabled) setEnabled(mc, true);
+        }
+
+        sendHandState(mc, enabled && mc.screen == null && FreeAimConfig.PARRY_ENABLED.get());
         if (!enabled) return;
 
         if (mc.screen != null) {          // inventory etc: give the normal cursor back
             setCursorHidden(mc, false);
             leftDown = false;
+            middleDown = false;
             return;
         }
 
@@ -284,7 +353,9 @@ public class FreeAimClient {
         }
         setCursorHidden(mc, true);
 
-        if (leftDown) continueBreaking(mc);
+        boolean mining = leftDown || swingMineTicks > 0;
+        if (swingMineTicks > 0) swingMineTicks--;
+        if (mining) continueBreaking(mc);
         else mc.gameMode.stopDestroyBlock();
     }
 
@@ -302,6 +373,8 @@ public class FreeAimClient {
         } else if (e.getButton() == GLFW.GLFW_MOUSE_BUTTON_RIGHT) {
             if (press) useAtHand(mc);
             else if (mc.player.isUsingItem()) mc.gameMode.releaseUsingItem(mc.player);
+        } else if (e.getButton() == GLFW.GLFW_MOUSE_BUTTON_MIDDLE) {
+            middleDown = press;                                           // hold to guard
         }
     }
 
@@ -314,7 +387,8 @@ public class FreeAimClient {
     /**
      * Every frame: read raw mouse movement, snap the OS cursor back to the middle, then
      *  1. aim the hand with the movement (or, with LOOK held, turn the head instead),
-     *  2. let the head ease toward the hand and be dragged if the hand leaves the view cone.
+     *  2. let the head ease toward the hand and be dragged if the hand leaves the view cone,
+     *  3. measure how fast the hand is moving: fast = swing (hit / mine) and opens a parry window.
      */
     @SubscribeEvent
     public static void onRenderTick(TickEvent.RenderTickEvent e) {
@@ -339,13 +413,14 @@ public class FreeAimClient {
         boolean look = LOOK.isDown();
         int invert = mc.options.invertYMouse().get() ? -1 : 1;
         double f = mouseFactor(mc);
+        double sens = FreeAimConfig.HAND_SENSITIVITY.get();
 
         if (!skipDelta) {
             if (look) {
                 player.turn(dx * f, dy * f * invert);                       // head only
             } else {
-                handYaw += dx * f * 0.15 * HAND_SENSITIVITY;                // hand only
-                handPitch = Mth.clamp(handPitch + dy * f * 0.15 * invert * HAND_SENSITIVITY, -90.0, 90.0);
+                handYaw += dx * f * 0.15 * sens;                            // hand only
+                handPitch = Mth.clamp(handPitch + dy * f * 0.15 * invert * sens, -90.0, 90.0);
             }
         }
         skipDelta = false;
@@ -354,14 +429,16 @@ public class FreeAimClient {
             double yawDiff = Mth.wrapDegrees(handYaw - player.getYRot());
             double pitchDiff = handPitch - player.getXRot();
 
-            double soft = 1.0 - Math.exp(-FOLLOW_RATE * dt);                // gentle ease toward the hand
+            double soft = 1.0 - Math.exp(-FreeAimConfig.FOLLOW_RATE.get() * dt);   // gentle ease toward the hand
             double dYaw = yawDiff * soft;
             double dPitch = pitchDiff * soft;
 
+            double coneYaw = FreeAimConfig.CONE_YAW.get();
+            double conePitch = FreeAimConfig.CONE_PITCH.get();
             double remYaw = yawDiff - dYaw;                                  // hard limit: hand stays in the cone
             double remPitch = pitchDiff - dPitch;
-            if (Math.abs(remYaw) > CONE_YAW) dYaw += remYaw - Math.signum(remYaw) * CONE_YAW;
-            if (Math.abs(remPitch) > CONE_PITCH) dPitch += remPitch - Math.signum(remPitch) * CONE_PITCH;
+            if (Math.abs(remYaw) > coneYaw) dYaw += remYaw - Math.signum(remYaw) * coneYaw;
+            if (Math.abs(remPitch) > conePitch) dPitch += remPitch - Math.signum(remPitch) * conePitch;
 
             if (dYaw != 0.0 || dPitch != 0.0) player.turn(dYaw / 0.15, dPitch / 0.15);
         } else {
@@ -370,6 +447,23 @@ public class FreeAimClient {
             if (Math.abs(yawDiff) > HAND_MAX_YAW) handYaw = player.getYRot() + Math.signum(yawDiff) * HAND_MAX_YAW;
             double pitchDiff = handPitch - player.getXRot();
             if (Math.abs(pitchDiff) > HAND_MAX_PITCH) handPitch = player.getXRot() + Math.signum(pitchDiff) * HAND_MAX_PITCH;
+        }
+
+        // ---- hand speed (angular, world space) ----
+        double dY = Mth.wrapDegrees(handYaw - lastHandYaw);
+        double dP = handPitch - lastHandPitch;
+        lastHandYaw = handYaw;
+        lastHandPitch = handPitch;
+        double yawPart = dY * Math.cos(Math.toRadians(handPitch));
+        double angular = Math.sqrt(yawPart * yawPart + dP * dP);
+        double inst = dt > 1.0e-4 ? angular / dt : 0.0;
+        swingSpeed += (inst - swingSpeed) * (1.0 - Math.exp(-dt / 0.04));
+
+        if (!look) {
+            if (swingSpeed >= FreeAimConfig.SWING_SPEED.get()) trySwingHit(mc);
+            if (swingSpeed >= FreeAimConfig.PARRY_SWING_SPEED.get()) {
+                parryUntilNanos = now + (long) (FreeAimConfig.PARRY_WINDOW.get() * 1.0e9);
+            }
         }
     }
 
@@ -394,6 +488,7 @@ public class FreeAimClient {
         float side = right ? 1.0f : -1.0f;
         float swing = e.getSwingProgress();
         float equip = e.getEquipProgress();
+        float scale = FreeAimConfig.HAND_SCALE.get().floatValue();
 
         Camera cam = mc.gameRenderer.getMainCamera();
         // The hand layer uses its own 70° FOV; rescale so it lines up with the world at your FOV setting.
@@ -401,7 +496,7 @@ public class FreeAimClient {
 
         Vec3 dirW = handDirection();
         double poke = Mth.sin(swing * Mth.PI) * 0.3;
-        Vec3 gripW = shoulder(mc, cam).add(dirW.scale(ARM + poke));
+        Vec3 gripW = shoulder(mc, cam).add(dirW.scale(FreeAimConfig.ARM_LENGTH.get() + poke));
         Vec3 gripC = toCameraSpace(cam, gripW);
         Vec3 aheadC = toCameraSpace(cam, gripW.add(dirW));
         gripC = new Vec3(gripC.x * ratio, gripC.y * ratio, gripC.z);
@@ -415,7 +510,7 @@ public class FreeAimClient {
         float fy = stack.isEmpty() ? 0.0f : 0.7071f;
         float fz = stack.isEmpty() ? -1.0f : -0.7071f;
         ps.mulPose(new Quaternionf().rotationTo(0f, fy, fz, (float) dirC.x, (float) dirC.y, (float) dirC.z));
-        ps.scale(HAND_SCALE, HAND_SCALE, HAND_SCALE);
+        ps.scale(scale, scale, scale);
 
         if (stack.isEmpty()) {
             // Same arm placement chain vanilla uses, minus its fixed screen-corner offset.
@@ -443,6 +538,7 @@ public class FreeAimClient {
     public static void onOverlay(RenderGuiOverlayEvent.Pre e) {
         if (!enabled || e.getOverlay() != VanillaGuiOverlay.CROSSHAIR.type()) return;
         e.setCanceled(true);
+        if (!FreeAimConfig.SHOW_RETICLE.get()) return;
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null || mc.level == null) return;
 
@@ -467,6 +563,7 @@ public class FreeAimClient {
     @SubscribeEvent
     public static void onLevelRender(RenderLevelStageEvent e) {
         if (!enabled || e.getStage() != RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS) return;
+        if (!FreeAimConfig.SHOW_OUTLINE.get()) return;
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null || mc.level == null || mc.screen != null) return;
         if (!(pick(mc) instanceof BlockHitResult bh)) return;
